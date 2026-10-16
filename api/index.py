@@ -14,15 +14,20 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 
-# --- Redis Config (Vercel KV / Upstash) ---
-KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
-KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+# --- Redis Config - هر 3 حالت Vercel KV رو ساپورت میکنه ---
+KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_URL")
+KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_READ_ONLY_TOKEN")
+
+print(f"KV_URL set: {bool(KV_URL)}")
+print(f"KV_TOKEN set: {bool(KV_TOKEN)}")
 
 def db_get(key, default):
-    if KV_URL and KV_TOKEN:
+    if KV_URL and KV_TOKEN and KV_URL.startswith("http"):
         try:
             r = httpx.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=["GET", key], timeout=10)
-            res = r.json().get("result")
+            j = r.json()
+            res = j.get("result")
+            print(f"DB GET {key}: {j}")
             if res:
                 return json.loads(res)
             return default
@@ -30,6 +35,7 @@ def db_get(key, default):
             print(f"DB GET error {key}: {e}")
             return default
     else:
+        print(f"DB GET fallback /tmp for {key}")
         path = f"/tmp/{key}.json"
         if os.path.exists(path):
             try:
@@ -40,14 +46,15 @@ def db_get(key, default):
         return default
 
 def db_set(key, value):
-    if KV_URL and KV_TOKEN:
+    if KV_URL and KV_TOKEN and KV_URL.startswith("http"):
         try:
             val_str = json.dumps(value, ensure_ascii=False)
             r = httpx.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=["SET", key, val_str], timeout=10)
-            print(f"DB SET {key}: {r.status_code}")
+            print(f"DB SET {key}: {r.text[:200]}")
         except Exception as e:
             print(f"DB SET error {key}: {e}")
     else:
+        print(f"DB SET fallback /tmp for {key}")
         path = f"/tmp/{key}.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False, indent=2)
@@ -110,11 +117,10 @@ tools = [
 
 SYSTEM_PROMPT = """
 تو یک دستیار هوشمند خودمختار و بسیار دقیق هستی.
-وظیفه تو اینه که دستورات کاربر که از تلگرام میاد رو با فکر کردن مرحله به مرحله و استفاده از ابزارها اجرا کنی.
 - اگر کاربر گفت "یاد بگیر" یا "ذخیره کن" از remember_info استفاده کن
 - اگر تسکی داد از manage_task استفاده کن
 - اگر سوالی پرسید که نیاز به اطلاعات روز داره از search_web استفاده کن
-- همیشه فارسی و صمیمی جواب بده و در آخر گزارش بده چه کردی
+- همیشه فارسی و صمیمی جواب بده
 """
 
 async def agent_brain(user_text: str):
@@ -159,7 +165,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         await update.message.reply_text("⛔ شما دسترسی ندارید")
         return
-    user_text = update.message.text
+    user_text = update.message.text.strip()
+
+    # --- فیکس مستقیم برای ذخیره بدون نیاز به مدل ---
+    if user_text.startswith("یاد بگیر") or user_text.startswith("ذخیره کن"):
+        content = user_text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
+        if "اسم من" in content:
+            val = content.split("اسم من")[-1].replace("هست","").replace("است","").replace("هستم","").strip().replace(":", "").strip()
+            res = remember_info("اسم", val, "save")
+            await update.message.reply_text(f"✅ {res} - سلام {val} عزیز! ذخیره شد.")
+            return
+        else:
+            # حالت کلی: یاد بگیر پروژه = فروشگاه
+            if "=" in content:
+                k, v = content.split("=", 1)
+                res = remember_info(k.strip(), v.strip(), "save")
+            elif " " in content and len(content.split()) >= 2:
+                parts = content.split()
+                k = parts[0]
+                v = " ".join(parts[1:])
+                res = remember_info(k, v, "save")
+            else:
+                res = remember_info("یادداشت", content, "save")
+            await update.message.reply_text(f"✅ {res}")
+            return
+
+    if "اسم من چیه" in user_text or "نام من چیه" in user_text:
+        res = remember_info("اسم", "", "get")
+        if res == "چیزی یافت نشد":
+            await update.message.reply_text("هنوز اسمت رو نمیدونم، بگو یاد بگیر اسم من ...")
+        else:
+            await update.message.reply_text(f"اسم شما {res} هست 😊")
+        return
+
     if user_text.startswith("/task "):
         result = manage_task("add", task=user_text[6:])
         await update.message.reply_text(result)
@@ -176,6 +214,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("فرمت: /done 1")
         return
+    if user_text.startswith("/memory"):
+        result = remember_info("all", "", "list")
+        await update.message.reply_text(result)
+        return
+
     answer = await agent_brain(user_text)
     if not answer or answer.strip() == "":
         answer = "انجام شد ✅"
