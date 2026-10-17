@@ -30,8 +30,12 @@ def _r():
     global _redis
     if _redis is None:
         import redis
-        _redis = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+        _redis = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5, socket_connect_timeout=5, health_check_interval=30)
     return _redis
+
+def _reset():
+    global _redis
+    _redis = None
 
 def _use_redis(): return bool(REDIS_URL and REDIS_URL.startswith("redis"))
 def _use_kv(): return bool(KV_URL and KV_TOKEN and KV_URL.startswith("http"))
@@ -44,7 +48,7 @@ def db_get(key, default):
         try:
             v = _r().get(key)
             return json.loads(v) if v else default
-        except Exception as e: print(f"DB GET REDIS err: {e}")
+        except Exception as e: print(f"DB GET REDIS err: {e}"); _reset()
     if _use_kv():
         try:
             res = _kv(["GET", key])
@@ -57,7 +61,7 @@ def db_set(key, value):
     if _use_redis():
         try:
             _r().set(key, val_str); print(f"DB SET REDIS {key}: ok"); return
-        except Exception as e: print(f"DB SET REDIS err: {e}")
+        except Exception as e: print(f"DB SET REDIS err: {e}"); _reset()
     if _use_kv():
         try:
             _kv(["SET", key, val_str]); print(f"DB SET KV {key}: ok"); return
@@ -70,11 +74,11 @@ def is_new_update(uid):
     try:
         if _use_redis(): return bool(_r().set(k, "1", nx=True, ex=600))
         if _use_kv(): return _kv(["SET", k, "1", "NX", "EX", "600"]) == "OK"
-    except Exception as e: print(f"DEDUP err: {e}")
+    except Exception as e: print(f"DEDUP err: {e}"); _reset()
     if k in _seen: return False
     _seen.add(k); return True
 
-client = OpenAI(api_key=OPENAI_KEY, base_url=BASE_URL)
+client = OpenAI(api_key=OPENAI_KEY, base_url=BASE_URL, max_retries=0)
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
 
 # --- TOOLS ---
@@ -209,11 +213,13 @@ def run_tool(name, args):
     if name == "file_store": return file_store(args["action"], args["filename"], args.get("content", ""))
     return "ابزار ناشناخته"
 
+DEADLINE = 50          # کل زمان مجاز برای یک درخواست (ثانیه)
 MAX_STEPS = 6          # حداکثر مرحله‌ی ابزار
-TIME_BUDGET = 32       # بعد از این ثانیه مرحله‌ی جدید شروع نمی‌شود (محدودیت Vercel ۶۰ ثانیه است)
+TIME_BUDGET = 28       # بعد از این ثانیه مرحله‌ی جدید شروع نمی‌شود (محدودیت Vercel ۶۰ ثانیه است)
 
 async def agent_brain(user_text: str):
     t0 = time.monotonic()
+    def to(): return max(5, min(30, DEADLINE - 5 - (time.monotonic() - t0)))
     messages = [{"role":"system","content":SYSTEM_PROMPT}, {"role":"user","content":user_text}]
 
     async def call_tool(tc, step):
@@ -229,7 +235,7 @@ async def agent_brain(user_text: str):
     while step < MAX_STEPS and time.monotonic() - t0 < TIME_BUDGET:
         try:
             r = await asyncio.to_thread(lambda: client.chat.completions.create(
-                model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto", timeout=30))
+                model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto", timeout=to()))
             msg = r.choices[0].message
             if not msg.tool_calls:
                 return msg.content or "انجام شد ✅"
@@ -250,7 +256,7 @@ async def agent_brain(user_text: str):
     print(f"FINAL summary after {step} steps, {time.monotonic()-t0:.0f}s")
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
     try:
-        final = await asyncio.to_thread(lambda: client.chat.completions.create(model=MODEL_NAME, messages=messages, timeout=30))
+        final = await asyncio.to_thread(lambda: client.chat.completions.create(model=MODEL_NAME, messages=messages, timeout=to()))
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
@@ -263,6 +269,9 @@ async def send_message(chat_id, text):
                 await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":chunk}, timeout=15)
                 print(f"Sent to {chat_id}")
             except Exception as e: print(f"Send err: {e}")
+
+def norm(t):
+    return t.replace("ي","ی").replace("ك","ک").replace("\u200c"," ").replace("\u200f","").strip()
 
 async def run(fn, *a): return await asyncio.to_thread(fn, *a)
 
@@ -286,7 +295,7 @@ async def webhook(req: Request):
         if not await run(is_new_update, data.get("update_id")): return {"ok":True}
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
-        text = (msg.get("text") or msg.get("caption") or "").strip()
+        text = norm(msg.get("text") or msg.get("caption") or "")
         print(f"From {user_id}: {text[:300]}")
         if user_id != ALLOWED_USER_ID:
             await send_message(chat_id,"⛔ شما دسترسی ندارید")
@@ -311,7 +320,8 @@ async def webhook(req: Request):
                 res=await run(remember_info,"یادداشت",content,"save")
             await send_message(chat_id,f"✅ {res}")
             return {"ok":True}
-        if "اسم من چیه" in text or "نام من چیه" in text:
+        if "اسم من چی" in text or "نام من چی" in text:
+            print("PATH: name-question")
             res=await run(remember_info,"اسم","","get")
             await send_message(chat_id,f"اسم شما {res} هست 😊" if res!="یافت نشد" else "هنوز اسمت رو نمیدونم")
             return {"ok":True}
@@ -324,7 +334,11 @@ async def webhook(req: Request):
         if text.startswith("/memory"):
             await send_message(chat_id, await run(remember_info,"all","","list"))
             return {"ok":True}
-        ans = await agent_brain(text)
+        print("PATH: agent")
+        try: ans = await asyncio.wait_for(agent_brain(text), timeout=DEADLINE)
+        except asyncio.TimeoutError:
+            print("DEADLINE hit")
+            ans = "⏱ زمان پردازش تمام شد (سرویس مدل کند بود). یک بار دوباره بفرست یا سؤال را کوتاه‌تر کن."
         await send_message(chat_id, ans or "انجام شد ✅")
         return {"ok":True}
     except Exception as e:
