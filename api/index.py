@@ -1,9 +1,5 @@
 from fastapi import FastAPI, Request
-import os
-import json
-import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import os, json, httpx
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -13,235 +9,148 @@ BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("KV_URL")
+KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
+KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-# --- Redis Config - هر 3 حالت Vercel KV رو ساپورت میکنه ---
-KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_URL")
-KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_READ_ONLY_TOKEN")
-
-print(f"KV_URL set: {bool(KV_URL)}")
-print(f"KV_TOKEN set: {bool(KV_TOKEN)}")
+print(f"REDIS_URL: {bool(REDIS_URL)} | KV_URL: {bool(KV_URL)}")
 
 def db_get(key, default):
-    if KV_URL and KV_TOKEN and KV_URL.startswith("http"):
+    if REDIS_URL and REDIS_URL.startswith("redis"):
+        try:
+            import redis
+            r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
+            val = r.get(key)
+            print(f"DB GET REDIS {key}: {bool(val)}")
+            if val: return json.loads(val)
+            return default
+        except Exception as e: print(f"DB GET REDIS err: {e}")
+    if KV_URL and KV_TOKEN:
         try:
             r = httpx.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=["GET", key], timeout=10)
-            j = r.json()
-            res = j.get("result")
-            print(f"DB GET {key}: {j}")
-            if res:
-                return json.loads(res)
+            res = r.json().get("result")
+            if res: return json.loads(res)
             return default
-        except Exception as e:
-            print(f"DB GET error {key}: {e}")
-            return default
-    else:
-        print(f"DB GET fallback /tmp for {key}")
-        path = f"/tmp/{key}.json"
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return default
-        return default
+        except Exception as e: print(f"DB GET KV err: {e}")
+    path = f"/tmp/{key}.json"
+    if os.path.exists(path):
+        try: return json.load(open(path,"r",encoding="utf-8"))
+        except: return default
+    return default
 
 def db_set(key, value):
-    if KV_URL and KV_TOKEN and KV_URL.startswith("http"):
+    val_str = json.dumps(value, ensure_ascii=False)
+    if REDIS_URL and REDIS_URL.startswith("redis"):
         try:
-            val_str = json.dumps(value, ensure_ascii=False)
+            import redis
+            r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
+            r.set(key, val_str)
+            print(f"DB SET REDIS {key}: ok")
+            return
+        except Exception as e: print(f"DB SET REDIS err: {e}")
+    if KV_URL and KV_TOKEN:
+        try:
             r = httpx.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=["SET", key, val_str], timeout=10)
-            print(f"DB SET {key}: {r.text[:200]}")
-        except Exception as e:
-            print(f"DB SET error {key}: {e}")
-    else:
-        print(f"DB SET fallback /tmp for {key}")
-        path = f"/tmp/{key}.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
+            print(f"DB SET KV {key}: {r.status_code}")
+            return
+        except Exception as e: print(f"DB SET KV err: {e}")
+    with open(f"/tmp/{key}.json","w",encoding="utf-8") as f: json.dump(value,f,ensure_ascii=False,indent=2)
 
 client = OpenAI(api_key=OPENAI_KEY, base_url=BASE_URL)
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
 
-def search_web(query: str):
-    if not tavily:
-        return "کلید Tavily تنظیم نشده"
+def search_web(q):
+    if not tavily: return "Tavily تنظیم نشده"
     try:
-        result = tavily.search(query=query, max_results=5, include_answer=True)
-        answer = result.get('answer', '')
-        results = result.get('results', [])[:2]
-        return answer + "\n\n" + str(results)
-    except Exception as e:
-        return f"خطا در جستجو: {e}"
+        r=tavily.search(query=q, max_results=3, include_answer=True)
+        return r.get('answer','')+str(r.get('results',[])[:1])
+    except Exception as e: return str(e)
 
-def manage_task(action: str, task: str = "", task_id: int = 0):
-    tasks = db_get("tasks", [])
-    if action == "add":
-        tasks.append({"id": len(tasks)+1, "task": task, "status": "pending"})
-        db_set("tasks", tasks)
-        return f"تسک اضافه شد: {task}"
-    elif action == "list":
-        if not tasks:
-            return "هیچ تسکی وجود ندارد"
+def manage_task(action, task="", task_id=0):
+    tasks=db_get("tasks",[])
+    if action=="add":
+        tasks.append({"id":len(tasks)+1,"task":task,"status":"pending"})
+        db_set("tasks",tasks); return f"تسک اضافه شد: {task}"
+    if action=="list":
+        if not tasks: return "هیچ تسکی نیست"
         return "\n".join([f"{t['id']}. {t['task']} - {t['status']}" for t in tasks])
-    elif action == "done":
+    if action=="done":
         for t in tasks:
-            if t['id'] == task_id:
-                t['status'] = "done"
-        db_set("tasks", tasks)
-        return f"تسک {task_id} انجام شد"
-    elif action == "delete":
-        tasks = [t for t in tasks if t['id'] != task_id]
-        db_set("tasks", tasks)
-        return f"تسک {task_id} حذف شد"
-    return "عملیات نامعتبر"
+            if t['id']==task_id: t['status']="done"
+        db_set("tasks",tasks); return f"تسک {task_id} انجام شد"
+    return "نامعتبر"
 
-def remember_info(key: str, value: str = "", action: str = "save"):
-    memory = db_get("memory", {})
-    if action == "save":
-        memory[key] = value
-        db_set("memory", memory)
-        return f"ذخیره شد: {key} = {value}"
-    elif action == "get":
-        return memory.get(key, "چیزی یافت نشد")
-    elif action == "list":
-        if not memory:
-            return "حافظه خالی است"
-        return json.dumps(memory, ensure_ascii=False, indent=2)
+def remember_info(key,value="",action="save"):
+    m=db_get("memory",{})
+    if action=="save": m[key]=value; db_set("memory",m); return f"ذخیره شد {key}={value}"
+    if action=="get": return m.get(key,"یافت نشد")
+    if action=="list": return json.dumps(m,ensure_ascii=False,indent=2)
     return "خطا"
 
-tools = [
-    {"type": "function", "function": {"name": "search_web", "description": "جستجو در اینترنت برای اطلاعات روز", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "manage_task", "description": "مدیریت تسک ها و کارها", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["add", "list", "done", "delete"]}, "task": {"type": "string"}, "task_id": {"type": "integer"}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "remember_info", "description": "ذخیره یا یادآوری اطلاعات مهم کاربر", "parameters": {"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}, "action": {"type": "string", "enum": ["save", "get", "list"]}}, "required": ["key", "action"]}}}
+tools=[
+ {"type":"function","function":{"name":"search_web","description":"جستجو","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+ {"type":"function","function":{"name":"manage_task","description":"تسک","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","list","done"]},"task":{"type":"string"},"task_id":{"type":"integer"}},"required":["action"]}}},
+ {"type":"function","function":{"name":"remember_info","description":"حافظه","parameters":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"action":{"type":"string","enum":["save","get","list"]}},"required":["key","action"]}}}
 ]
+SYSTEM_PROMPT="تو دستیار فارسی هستی. ابزارها را استفاده کن."
 
-SYSTEM_PROMPT = """
-تو یک دستیار هوشمند خودمختار و بسیار دقیق هستی.
-- اگر کاربر گفت "یاد بگیر" یا "ذخیره کن" از remember_info استفاده کن
-- اگر تسکی داد از manage_task استفاده کن
-- اگر سوالی پرسید که نیاز به اطلاعات روز داره از search_web استفاده کن
-- همیشه فارسی و صمیمی جواب بده
-"""
-
-async def agent_brain(user_text: str):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_text}]
+async def agent_brain(text):
+    messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":text}]
     try:
-        response = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto")
-        msg = response.choices[0].message
+        r=client.chat.completions.create(model=MODEL_NAME,messages=messages,tools=tools,tool_choice="auto")
+        msg=r.choices[0].message
         if msg.tool_calls:
             messages.append(msg)
-            for tool_call in msg.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                print(f"Agent tool: {name} {args}")
-                if name == "search_web":
-                    result = search_web(args["query"])
-                elif name == "manage_task":
-                    result = manage_task(args["action"], args.get("task",""), args.get("task_id",0))
-                elif name == "remember_info":
-                    result = remember_info(args["key"], args.get("value",""), args["action"])
-                else:
-                    result = "ابزار یافت نشد"
-                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
-            final = client.chat.completions.create(model=MODEL_NAME, messages=messages)
-            final_answer = final.choices[0].message.content
-            if not final_answer or final_answer.strip() == "":
-                return "انجام شد ✅"
-            return final_answer
-        else:
-            return msg.content if msg.content else "متوجه نشدم، میشه دوباره بگی؟"
-    except Exception as e:
-        print(f"agent_brain error: {e}")
-        return f"متاسفانه خطایی رخ داد: {str(e)[:200]}"
+            for tc in msg.tool_calls:
+                name=tc.function.name; args=json.loads(tc.function.arguments)
+                if name=="search_web": res=search_web(args["query"])
+                elif name=="manage_task": res=manage_task(args["action"],args.get("task",""),args.get("task_id",0))
+                elif name=="remember_info": res=remember_info(args["key"],args.get("value",""),args["action"])
+                else: res="یافت نشد"
+                messages.append({"role":"tool","tool_call_id":tc.id,"content":res})
+            final=client.chat.completions.create(model=MODEL_NAME,messages=messages)
+            return final.choices[0].message.content or "انجام شد ✅"
+        return msg.content or "متوجه نشدم"
+    except Exception as e: return f"خطا: {e}"
 
-tg_app = Application.builder().token(BOT_TOKEN).build()
+async def send_message(chat_id, text):
+    async with httpx.AsyncClient() as c:
+        await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":text})
+        print(f"Sent to {chat_id}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-    await update.message.reply_text("سلام! من دستیار هوشمند شما هستم 🤖\nربات روی Vercel + دیتابیس روشنه ✅")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await update.message.reply_text("⛔ شما دسترسی ندارید")
-        return
-    user_text = update.message.text.strip()
-
-    # --- فیکس مستقیم برای ذخیره بدون نیاز به مدل ---
-    if user_text.startswith("یاد بگیر") or user_text.startswith("ذخیره کن"):
-        content = user_text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
-        if "اسم من" in content:
-            val = content.split("اسم من")[-1].replace("هست","").replace("است","").replace("هستم","").strip().replace(":", "").strip()
-            res = remember_info("اسم", val, "save")
-            await update.message.reply_text(f"✅ {res} - سلام {val} عزیز! ذخیره شد.")
-            return
-        else:
-            # حالت کلی: یاد بگیر پروژه = فروشگاه
-            if "=" in content:
-                k, v = content.split("=", 1)
-                res = remember_info(k.strip(), v.strip(), "save")
-            elif " " in content and len(content.split()) >= 2:
-                parts = content.split()
-                k = parts[0]
-                v = " ".join(parts[1:])
-                res = remember_info(k, v, "save")
-            else:
-                res = remember_info("یادداشت", content, "save")
-            await update.message.reply_text(f"✅ {res}")
-            return
-
-    if "اسم من چیه" in user_text or "نام من چیه" in user_text:
-        res = remember_info("اسم", "", "get")
-        if res == "چیزی یافت نشد":
-            await update.message.reply_text("هنوز اسمت رو نمیدونم، بگو یاد بگیر اسم من ...")
-        else:
-            await update.message.reply_text(f"اسم شما {res} هست 😊")
-        return
-
-    if user_text.startswith("/task "):
-        result = manage_task("add", task=user_text[6:])
-        await update.message.reply_text(result)
-        return
-    if user_text.startswith("/tasks"):
-        result = manage_task("list")
-        await update.message.reply_text(result)
-        return
-    if user_text.startswith("/done "):
-        try:
-            tid = int(user_text.split()[1])
-            result = manage_task("done", task_id=tid)
-            await update.message.reply_text(result)
-        except:
-            await update.message.reply_text("فرمت: /done 1")
-        return
-    if user_text.startswith("/memory"):
-        result = remember_info("all", "", "list")
-        await update.message.reply_text(result)
-        return
-
-    answer = await agent_brain(user_text)
-    if not answer or answer.strip() == "":
-        answer = "انجام شد ✅"
-    await update.message.reply_text(answer)
-
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-tg_app.add_handler(MessageHandler(filters.COMMAND, handle_message))
-
-# --- FastAPI برای Vercel ---
-fastapi_app = FastAPI()
-
-@fastapi_app.get("/")
-async def root():
-    return {"status": "Bot is running on Vercel with DB"}
-
-@fastapi_app.post("/api/index")
+app=FastAPI()
+@app.get("/")
+async def root(): return {"status":"Bot Vercel DB","redis":bool(REDIS_URL),"kv":bool(KV_URL)}
+@app.post("/api/index")
 async def webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.initialize()
-    await tg_app.process_update(update)
-    await tg_app.shutdown()
-    return {"ok": True}
-
-app = fastapi_app
+    try:
+        data=await req.json()
+        print(f"Incoming: {str(data)[:400]}")
+        msg=data.get("message") or data.get("edited_message")
+        if not msg: return {"ok":True}
+        chat_id=msg["chat"]["id"]; user_id=msg["from"]["id"]; text=msg.get("text","")
+        print(f"From {user_id}: {text}")
+        if user_id != ALLOWED_USER_ID:
+            await send_message(chat_id,"⛔ دسترسی ندارید"); return {"ok":True}
+        if text.startswith("/start"):
+            await send_message(chat_id,"سلام! ربات Vercel + Redis Cloud روشنه 🤖"); return {"ok":True}
+        if text.startswith("یاد بگیر") or text.startswith("ذخیره کن"):
+            content=text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
+            if "اسم من" in content:
+                val=content.split("اسم من")[-1].replace("هست","").replace("است","").strip(" :")
+                res=remember_info("اسم",val,"save")
+                await send_message(chat_id,f"✅ {res} سلام {val}!"); return
+            if "=" in content:
+                k,v=content.split("=",1); res=remember_info(k.strip(),v.strip(),"save")
+            else: res=remember_info("یادداشت",content,"save")
+            await send_message(chat_id,f"✅ {res}"); return
+        if "اسم من چیه" in text:
+            res=remember_info("اسم","","get")
+            await send_message(chat_id,f"اسم شما {res} هست" if res!="یافت نشد" else "هنوز نمیدونم"); return
+        if text.startswith("/tasks"): await send_message(chat_id, manage_task("list")); return
+        if text.startswith("/task "): await send_message(chat_id, manage_task("add",task=text[6:])); return
+        ans=await agent_brain(text)
+        await send_message(chat_id, ans)
+        return {"ok":True}
+    except Exception as e:
+        print(f"Webhook err: {e}"); return {"ok":False}
