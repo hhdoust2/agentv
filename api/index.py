@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-import os, json, httpx, traceback, io, contextlib
+import os, json, httpx, traceback, io, contextlib, asyncio
 from openai import OpenAI
 from tavily import TavilyClient
 from bs4 import BeautifulSoup
@@ -55,7 +55,7 @@ def db_set(key, value):
 client = OpenAI(api_key=OPENAI_KEY, base_url=BASE_URL)
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
 
-# --- HERMES TOOLS ---
+# --- TOOLS ---
 def search_web(query: str):
     if not tavily: return "Tavily API Key تنظیم نشده"
     try:
@@ -130,15 +130,16 @@ tools = [
  {"type":"function","function":{"name":"search_web","description":"جستجوی پیشرفته وب برای تحقیق عمیق","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
  {"type":"function","function":{"name":"browse_url","description":"باز کردن و خواندن محتوای یک URL","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
  {"type":"function","function":{"name":"execute_python","description":"نوشتن و اجرای کد پایتون و برگرداندن خروجی","parameters":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}}},
- {"type":"function","function":{"name":"manage_task","description":"مدیریت تسک پروژه","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","list","done","delete"]},"task":{"type":"string"},"task_id":{"type":"integer"}},"required":["action"]}}},
+ {"type":"function","function":{"name":"manage_task","description":"مدیریت تسک پروژه - فقط وقتی کاربر صریحا تسک گفت","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","list","done","delete"]},"task":{"type":"string"},"task_id":{"type":"integer"}},"required":["action"]}}},
  {"type":"function","function":{"name":"remember_info","description":"حافظه بلندمدت کاربر","parameters":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"action":{"type":"string","enum":["save","get","list"]}},"required":["key","action"]}}},
  {"type":"function","function":{"name":"file_store","description":"ذخیره و خواندن فایل متنی در دیتابیس","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["write","read","list"]},"filename":{"type":"string"},"content":{"type":"string"}},"required":["action","filename"]}}},
 ]
 
 SYSTEM_PROMPT = """
-تو هرمس هستی - یک ایجنت خودمختار پیشرفته و دقیق.
+تو یک ایجنت هوشمند و خودمختار هستی.
 قوانین:
-- برای کارهای پیچیده چند مرحله فکر کن و چند ابزار پشت سر هم صدا بزن (ReAct)
+- برای کارهای پیچیده چند مرحله فکر کن و چند ابزار پشت سر هم صدا بزن
+- فقط وقتی کاربر گفت "تسک" یا "وظیفه" از manage_task استفاده کن، برای "تحقیق کن" فقط search_web و browse_url بزن
 - اگر کاربر گفت "تحقیق کن" اول search_web بعد browse_url بزن بعد تحلیل کن
 - اگر کد یا تحلیل دیتا خواست با execute_python بنویس و اجرا کن
 - حافظه را با remember_info مدیریت کن
@@ -146,11 +147,11 @@ SYSTEM_PROMPT = """
 - هرگز نگو نمی‌توانم، تلاش کن
 """
 
-async def hermes_brain(user_text: str):
+async def agent_brain(user_text: str):
     messages = [{"role":"system","content":SYSTEM_PROMPT}, {"role":"user","content":user_text}]
-    for step in range(5):
+    for step in range(4):
         try:
-            r = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto")
+            r = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto", timeout=30)
             msg = r.choices[0].message
             if not msg.tool_calls:
                 return msg.content or "انجام شد ✅"
@@ -158,7 +159,7 @@ async def hermes_brain(user_text: str):
             for tc in msg.tool_calls:
                 name = tc.function.name
                 args = json.loads(tc.function.arguments)
-                print(f"HERMES step {step}: {name} {args}")
+                print(f"AGENT step {step}: {name} {args}")
                 if name=="search_web": res=search_web(args["query"])
                 elif name=="browse_url": res=browse_url(args["url"])
                 elif name=="execute_python": res=execute_python(args["code"])
@@ -166,12 +167,16 @@ async def hermes_brain(user_text: str):
                 elif name=="remember_info": res=remember_info(args["key"], args.get("value",""), args["action"])
                 elif name=="file_store": res=file_store(args["action"], args["filename"], args.get("content",""))
                 else: res="ابزار ناشناخته"
-                messages.append({"role":"tool","tool_call_id":tc.id,"content":str(res)[:4000]})
+                messages.append({"role":"tool","tool_call_id":tc.id,"content":str(res)[:3500]})
         except Exception as e:
-            print(f"HERMES err step {step}: {e}")
-            return f"خطای هرمس: {e}"
+            if "429" in str(e):
+                print("429 hit, waiting 5s...")
+                await asyncio.sleep(5)
+                continue
+            print(f"AGENT err step {step}: {e}")
+            return f"خطا: {e}"
     try:
-        final = client.chat.completions.create(model=MODEL_NAME, messages=messages)
+        final = client.chat.completions.create(model=MODEL_NAME, messages=messages, timeout=30)
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
@@ -186,7 +191,7 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status":"Hermes V2 running","redis":bool(REDIS_URL),"kv":bool(KV_URL)}
+    return {"status":"Agent running","redis":bool(REDIS_URL),"kv":bool(KV_URL)}
 
 @app.post("/api/index")
 async def webhook(req: Request):
@@ -203,7 +208,7 @@ async def webhook(req: Request):
             await send_message(chat_id,"⛔ شما دسترسی ندارید")
             return {"ok":True}
         if text.startswith("/start"):
-            await send_message(chat_id,"سلام! من هرمس V2 هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد پایتون بنویس و اجرا کن\n• مرورگر: لینک بفرست\n• حافظه دائمی + تسک + فایل")
+            await send_message(chat_id,"سلام! من ایجنت هوشمند تو هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد بنویس و اجرا کن\n• لینک بفرست تا خلاصه کنم\n• حافظه دائمی + تسک + فایل")
             return {"ok":True}
         if text.startswith("یاد بگیر") or text.startswith("ذخیره کن"):
             content=text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
@@ -232,7 +237,7 @@ async def webhook(req: Request):
         if text.startswith("/memory"):
             await send_message(chat_id, remember_info("all","","list"))
             return {"ok":True}
-        ans = await hermes_brain(text)
+        ans = await agent_brain(text)
         await send_message(chat_id, ans or "انجام شد ✅")
         return {"ok":True}
     except Exception as e:
