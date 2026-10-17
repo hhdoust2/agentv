@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Request, Response
+import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)  # جلوگیری از چاپ توکن ربات در لاگ
 import os, re, json, asyncio, traceback, ipaddress, socket, subprocess, sys
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
@@ -220,7 +222,17 @@ async def agent_brain(user_text: str, history: list):
     messages = [{"role": "system", "content": system_prompt()}] + history + [{"role": "user", "content": user_text}]
     retried = False
     step = 0
-    force = "search_web" if (tavily and LIVE_RE.search(user_text)) else None  # سؤال لحظه‌ای = حتماً اول جستجو
+    force = None
+    if LIVE_RE.search(user_text):  # داده‌ی لحظه‌ای: جستجو را خود کد انجام می‌دهد، نه مدل
+        if tavily:
+            res = await asyncio.to_thread(search_web, user_text)
+            print(f"PRESEARCH len={len(res)} err={res.startswith('خطا')}")
+            note = ("[نتایج جستجوی زنده‌ی وب، همین الان]\n" + res +
+                    "\n[فقط بر اساس همین نتایج جواب بده، منبع را بگو و اگر عدد دقیق نبود حدس نزن]")
+        else:
+            print("PRESEARCH skipped: TAVILY_API_KEY not set")
+            note = "[جستجوی وب در دسترس نیست. برای قیمت/اخبار لحظه‌ای عدد از حافظه نگو؛ بگو جستجو غیرفعال است]"
+        messages[-1]["content"] = user_text + "\n\n" + note
     while step < MAX_STEPS:
         try:
             r = await asyncio.to_thread(llm, messages, True, False, force if step == 0 else None)
@@ -278,7 +290,7 @@ app = FastAPI()
 @app.get("/api/index")
 async def root():
     return {"status": "Agent running", "db": "redis" if _use_redis() else ("kv" if _use_rest() else "memory"),
-            "python_tool": ENABLE_PYTHON}
+            "python_tool": ENABLE_PYTHON, "search": bool(tavily)}
 
 @app.post("/")
 @app.post("/api/index")
