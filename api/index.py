@@ -78,7 +78,30 @@ def is_new_update(uid):
     if k in _seen: return False
     _seen.add(k); return True
 
-client = OpenAI(api_key=OPENAI_KEY, base_url=BASE_URL, max_retries=0)
+_clients = {}
+
+def get_cfg():
+    """تنظیمات ذخیره‌شده داخل ربات اولویت دارد؛ اگر نبود از Environment Variables."""
+    st = db_get("settings", {}) or {}
+    return {"base_url": st.get("base_url") or BASE_URL,
+            "model": st.get("model") or MODEL_NAME,
+            "api_key": st.get("api_key") or OPENAI_KEY,
+            "saved": [k for k in ("base_url", "model", "api_key") if st.get(k)]}
+
+def get_client(cfg):
+    k = (cfg["base_url"], cfg["api_key"])
+    if k not in _clients:
+        _clients[k] = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], max_retries=0)
+    return _clients[k]
+
+def set_setting(name, value):
+    st = db_get("settings", {}) or {}
+    if value: st[name] = value
+    else: st.pop(name, None)
+    db_set("settings", st)
+
+def mask(k):
+    return "—" if not k else (k[:3] + "..." + k[-4:] if len(k) > 10 else "***")
 tavily = TavilyClient(api_key=TAVILY_KEY) if TAVILY_KEY else None
 
 # --- TOOLS ---
@@ -219,6 +242,10 @@ TIME_BUDGET = 28       # بعد از این ثانیه مرحله‌ی جدید 
 
 async def agent_brain(user_text: str):
     t0 = time.monotonic()
+    cfg = await asyncio.to_thread(get_cfg)
+    if not cfg["api_key"]:
+        return "کلید API تنظیم نشده. با دستور /key کلید را بفرست."
+    cli = get_client(cfg)
     def to(): return max(5, min(30, DEADLINE - 5 - (time.monotonic() - t0)))
     messages = [{"role":"system","content":SYSTEM_PROMPT}, {"role":"user","content":user_text}]
 
@@ -234,8 +261,8 @@ async def agent_brain(user_text: str):
     step = 0
     while step < MAX_STEPS and time.monotonic() - t0 < TIME_BUDGET:
         try:
-            r = await asyncio.to_thread(lambda: client.chat.completions.create(
-                model=MODEL_NAME, messages=messages, tools=tools, tool_choice="auto", timeout=to()))
+            r = await asyncio.to_thread(lambda: cli.chat.completions.create(
+                model=cfg["model"], messages=messages, tools=tools, tool_choice="auto", timeout=to()))
             msg = r.choices[0].message
             if not msg.tool_calls:
                 return msg.content or "انجام شد ✅"
@@ -256,7 +283,7 @@ async def agent_brain(user_text: str):
     print(f"FINAL summary after {step} steps, {time.monotonic()-t0:.0f}s")
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
     try:
-        final = await asyncio.to_thread(lambda: client.chat.completions.create(model=MODEL_NAME, messages=messages, timeout=to()))
+        final = await asyncio.to_thread(lambda: cli.chat.completions.create(model=cfg["model"], messages=messages, timeout=to()))
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
@@ -269,6 +296,13 @@ async def send_message(chat_id, text):
                 await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":chunk}, timeout=15)
                 print(f"Sent to {chat_id}")
             except Exception as e: print(f"Send err: {e}")
+
+async def delete_message(chat_id, message_id):
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+                         json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
+    except Exception as e: print(f"Delete err: {e}")
 
 def norm(t):
     return t.replace("ي","ی").replace("ك","ک").replace("\u200c"," ").replace("\u200f","").strip()
@@ -304,7 +338,43 @@ async def webhook(req: Request):
             await send_message(chat_id,"فعلاً فقط پیام متنی را می‌فهمم 🙂")
             return {"ok":True}
         if text.startswith("/start"):
-            await send_message(chat_id,"سلام! من ایجنت هوشمند تو هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد بنویس و اجرا کن\n• لینک بفرست تا خلاصه کنم\n• حافظه دائمی + تسک + فایل")
+            await send_message(chat_id,"سلام! من ایجنت هوشمند تو هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد بنویس و اجرا کن\n• لینک بفرست تا خلاصه کنم\n• حافظه دائمی + تسک + فایل\n• تنظیمات مدل: /settings ، /provider ، /model ، /key ، /test")
+            return {"ok":True}
+        if text.startswith("/settings"):
+            cfg = await run(get_cfg)
+            src = lambda k: "ذخیره‌شده در ربات" if k in cfg["saved"] else "از Vercel"
+            await send_message(chat_id, f"⚙️ تنظیمات فعلی:\n• پرووایدر: {cfg['base_url']} ({src('base_url')})\n• مدل: {cfg['model']} ({src('model')})\n• کلید: {mask(cfg['api_key'])} ({src('api_key')})\n\nتغییر: /provider آدرس ، /model نام ، /key کلید\nتست: /test ، بازگشت به Vercel: /resetsettings")
+            return {"ok":True}
+        if text.startswith("/resetsettings"):
+            await run(db_set, "settings", {})
+            await send_message(chat_id, "✅ تنظیمات ذخیره‌شده پاک شد؛ دوباره از Vercel خوانده می‌شود.")
+            return {"ok":True}
+        if text.startswith("/provider") or text.startswith("/model") or text.startswith("/key"):
+            cmd, _, val = text.partition(" ")
+            val = val.strip()
+            name = {"/provider": "base_url", "/model": "model", "/key": "api_key"}.get(cmd)
+            if name:
+                if name == "api_key": await delete_message(chat_id, msg.get("message_id"))
+                if not val:
+                    await send_message(chat_id, f"مقدار را بعد از دستور بنویس. مثال: {cmd} ..."); return {"ok":True}
+                if name == "base_url":
+                    val = val.rstrip("/")
+                    if not val.startswith("http"):
+                        await send_message(chat_id, "آدرس باید با https:// شروع شود. مثال: /provider https://api.openai.com/v1"); return {"ok":True}
+                await run(set_setting, name, val)
+                shown = mask(val) if name == "api_key" else val
+                await send_message(chat_id, f"✅ ذخیره شد ({name}): {shown}\nبرای امتحان: /test" + ("\n(پیام کلید از چت پاک شد)" if name == "api_key" else ""))
+                return {"ok":True}
+        if text.startswith("/test"):
+            cfg = await run(get_cfg)
+            if not cfg["api_key"]:
+                await send_message(chat_id, "کلید تنظیم نشده. /key کلید"); return {"ok":True}
+            try:
+                r = await asyncio.wait_for(asyncio.to_thread(lambda: get_client(cfg).chat.completions.create(
+                    model=cfg["model"], messages=[{"role":"user","content":"فقط بنویس OK"}], max_tokens=10, timeout=20)), 25)
+                await send_message(chat_id, f"✅ کار می‌کند\nمدل: {cfg['model']}\nجواب: {(r.choices[0].message.content or '').strip()[:100]}")
+            except Exception as e:
+                await send_message(chat_id, f"❌ خطا: {str(e)[:300]}")
             return {"ok":True}
         if text.startswith("یاد بگیر") or text.startswith("ذخیره کن"):
             content=text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
