@@ -19,6 +19,8 @@ except ValueError: ALLOWED_USER_ID = 0
 REDIS_URL = os.getenv("REDIS_URL") or os.getenv("KV_URL")
 KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
 KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+try: HISTORY_LEN = int(os.getenv("HISTORY_LEN", "6"))
+except ValueError: HISTORY_LEN = 6
 
 print(f"REDIS_URL: {bool(REDIS_URL)} | KV_URL: {bool(KV_URL)}")
 
@@ -240,14 +242,40 @@ DEADLINE = 50          # کل زمان مجاز برای یک درخواست (ث
 MAX_STEPS = 6          # حداکثر مرحله‌ی ابزار
 TIME_BUDGET = 28       # بعد از این ثانیه مرحله‌ی جدید شروع نمی‌شود (محدودیت Vercel ۶۰ ثانیه است)
 
-async def agent_brain(user_text: str):
+def _load_history(user_id):
+    """بارگذاری تاریخچه مکالمهٔ کاربر از دیتابیس."""
+    if HISTORY_LEN <= 0:
+        return []
+    h = db_get(f"hist:{user_id}", []) or []
+    return h[-HISTORY_LEN * 4:] or []
+
+def _save_history(user_id, messages):
+    """ذخیره تاریخچه گفتگو؛ فقط نقش‌های user و assistant (بدون ابزار و ابزارها)."""
+    if HISTORY_LEN <= 0:
+        return
+    h = db_get(f"hist:{user_id}", []) or []
+    for m in messages:
+        role = m.get("role")
+        if role == "user":
+            content = (m.get("content") or "").strip()
+            if content: h.append({"role": "user", "content": content[:3000]})
+        elif role == "assistant":
+            content = (m.get("content") or "").strip()
+            if content: h.append({"role": "assistant", "content": content[:3000]})
+    cap = max(HISTORY_LEN * 2, 10)
+    db_set(f"hist:{user_id}", h[-cap:])
+
+async def agent_brain(user_id, user_text: str):
     t0 = time.monotonic()
     cfg = await asyncio.to_thread(get_cfg)
     if not cfg["api_key"]:
         return "کلید API تنظیم نشده. با دستور /key کلید را بفرست."
     cli = get_client(cfg)
     def to(): return max(5, min(30, DEADLINE - 5 - (time.monotonic() - t0)))
-    messages = [{"role":"system","content":SYSTEM_PROMPT}, {"role":"user","content":user_text}]
+    history = await asyncio.to_thread(_load_history, user_id)
+    messages = [{"role":"system","content":SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role":"user","content":user_text})
 
     async def call_tool(tc, step):
         name = tc.function.name
@@ -265,6 +293,7 @@ async def agent_brain(user_text: str):
                 model=cfg["model"], messages=messages, tools=tools, tool_choice="auto", timeout=to()))
             msg = r.choices[0].message
             if not msg.tool_calls:
+                await asyncio.to_thread(_save_history, user_id, messages + [msg])
                 return msg.content or "انجام شد ✅"
             messages.append(msg)
             results = await asyncio.gather(*[call_tool(tc, step) for tc in msg.tool_calls])  # موازی
@@ -284,6 +313,7 @@ async def agent_brain(user_text: str):
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
     try:
         final = await asyncio.to_thread(lambda: cli.chat.completions.create(model=cfg["model"], messages=messages, timeout=to()))
+        await asyncio.to_thread(_save_history, user_id, messages + [final.choices[0].message])
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
@@ -395,6 +425,10 @@ async def webhook(req: Request):
             res=await run(remember_info,"اسم","","get")
             await send_message(chat_id,f"اسم شما {res} هست 😊" if res!="یافت نشد" else "هنوز اسمت رو نمیدونم")
             return {"ok":True}
+        if text.startswith("/reset"):
+            await run(db_set, f"hist:{user_id}", [])
+            await send_message(chat_id, "✅ حافظه مکالمه پاک شد")
+            return {"ok":True}
         if text.startswith("/tasks"):
             await send_message(chat_id, await run(manage_task,"list"))
             return {"ok":True}
@@ -405,7 +439,7 @@ async def webhook(req: Request):
             await send_message(chat_id, await run(remember_info,"all","","list"))
             return {"ok":True}
         print("PATH: agent")
-        try: ans = await asyncio.wait_for(agent_brain(text), timeout=DEADLINE)
+        try: ans = await asyncio.wait_for(agent_brain(user_id, text), timeout=DEADLINE)
         except asyncio.TimeoutError:
             print("DEADLINE hit")
             ans = "⏱ زمان پردازش تمام شد (سرویس مدل کند بود). یک بار دوباره بفرست یا سؤال را کوتاه‌تر کن."
