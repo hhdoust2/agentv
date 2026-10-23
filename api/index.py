@@ -243,27 +243,22 @@ MAX_STEPS = 6          # حداکثر مرحله‌ی ابزار
 TIME_BUDGET = 28       # بعد از این ثانیه مرحله‌ی جدید شروع نمی‌شود (محدودیت Vercel ۶۰ ثانیه است)
 
 def _load_history(user_id):
-    """بارگذاری تاریخچه مکالمهٔ کاربر از دیتابیس."""
+    """آخرین HISTORY_LEN تبادل (هر تبادل = یک سؤال + یک جواب) از دیتابیس."""
     if HISTORY_LEN <= 0:
         return []
     h = db_get(f"hist:{user_id}", []) or []
-    return h[-HISTORY_LEN * 4:] or []
+    h = [m for m in h if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
+    return h[-HISTORY_LEN * 2:]
 
-def _save_history(user_id, messages):
-    """ذخیره تاریخچه گفتگو؛ فقط نقش‌های user و assistant (بدون ابزار و ابزارها)."""
-    if HISTORY_LEN <= 0:
+def _save_history(user_id, user_text, answer):
+    """فقط همین یک تبادل (سؤال + جواب نهایی) به تاریخچه اضافه می‌شود."""
+    if HISTORY_LEN <= 0 or not user_text or not answer:
         return
     h = db_get(f"hist:{user_id}", []) or []
-    for m in messages:
-        role = m.get("role")
-        if role == "user":
-            content = (m.get("content") or "").strip()
-            if content: h.append({"role": "user", "content": content[:3000]})
-        elif role == "assistant":
-            content = (m.get("content") or "").strip()
-            if content: h.append({"role": "assistant", "content": content[:3000]})
-    cap = max(HISTORY_LEN * 2, 10)
-    db_set(f"hist:{user_id}", h[-cap:])
+    h = [m for m in h if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
+    h.append({"role": "user", "content": user_text[:3000]})
+    h.append({"role": "assistant", "content": answer[:3000]})
+    db_set(f"hist:{user_id}", h[-HISTORY_LEN * 2:])
 
 async def agent_brain(user_id, user_text: str):
     t0 = time.monotonic()
@@ -293,7 +288,7 @@ async def agent_brain(user_id, user_text: str):
                 model=cfg["model"], messages=messages, tools=tools, tool_choice="auto", timeout=to()))
             msg = r.choices[0].message
             if not msg.tool_calls:
-                await asyncio.to_thread(_save_history, user_id, messages + [msg])
+                await asyncio.to_thread(_save_history, user_id, user_text, msg.content)
                 return msg.content or "انجام شد ✅"
             messages.append(msg)
             results = await asyncio.gather(*[call_tool(tc, step) for tc in msg.tool_calls])  # موازی
@@ -313,7 +308,7 @@ async def agent_brain(user_id, user_text: str):
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
     try:
         final = await asyncio.to_thread(lambda: cli.chat.completions.create(model=cfg["model"], messages=messages, timeout=to()))
-        await asyncio.to_thread(_save_history, user_id, messages + [final.choices[0].message])
+        await asyncio.to_thread(_save_history, user_id, user_text, final.choices[0].message.content)
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
