@@ -260,7 +260,20 @@ def _save_history(user_id, user_text, answer):
     h.append({"role": "assistant", "content": answer[:3000]})
     db_set(f"hist:{user_id}", h[-HISTORY_LEN * 2:])
 
-async def agent_brain(user_id, user_text: str):
+TOOL_LABELS = {
+    "search_web": "🔎 در حال جستجوی وب...",
+    "browse_url": "🌐 در حال خواندن صفحه...",
+    "execute_python": "🐍 در حال اجرای کد...",
+    "manage_task": "📋 در حال کار با تسک‌ها...",
+    "remember_info": "🧠 در حال کار با حافظه...",
+    "file_store": "📁 در حال کار با فایل...",
+}
+
+async def agent_brain(user_id, user_text: str, on_status=None):
+    async def status(t):
+        if on_status:
+            try: await on_status(t)
+            except Exception as e: print(f"status err: {e}")
     t0 = time.monotonic()
     cfg = await asyncio.to_thread(get_cfg)
     if not cfg["api_key"]:
@@ -291,10 +304,16 @@ async def agent_brain(user_id, user_text: str):
                 await asyncio.to_thread(_save_history, user_id, user_text, msg.content)
                 return msg.content or "انجام شد ✅"
             messages.append(msg)
+            labels = []
+            for tc in msg.tool_calls:
+                l = TOOL_LABELS.get(tc.function.name, "⚙️ در حال اجرای ابزار...")
+                if l not in labels: labels.append(l)
+            await status("\n".join(labels))
             results = await asyncio.gather(*[call_tool(tc, step) for tc in msg.tool_calls])  # موازی
             for tc, res in zip(msg.tool_calls, results):
                 messages.append({"role":"tool","tool_call_id":tc.id,"content":str(res)[:3500]})
             step += 1
+            await status("🤔 در حال بررسی نتایج...")
         except Exception as e:
             if "429" in str(e):
                 print("429 hit, waiting 5s...")
@@ -306,6 +325,7 @@ async def agent_brain(user_id, user_text: str):
     # جمع‌بندی نهایی: بدون ابزار، با دستور صریح
     print(f"FINAL summary after {step} steps, {time.monotonic()-t0:.0f}s")
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
+    await status("✍️ در حال نوشتن جواب نهایی...")
     try:
         final = await asyncio.to_thread(lambda: cli.chat.completions.create(model=cfg["model"], messages=messages, timeout=to()))
         await asyncio.to_thread(_save_history, user_id, user_text, final.choices[0].message.content)
@@ -321,6 +341,21 @@ async def send_message(chat_id, text):
                 await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":chunk}, timeout=15)
                 print(f"Sent to {chat_id}")
             except Exception as e: print(f"Send err: {e}")
+
+async def tg(method, **payload):
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=10)
+            return r.json()
+    except Exception as e:
+        print(f"TG {method} err: {e}"); return {}
+
+async def typing_loop(chat_id, stop):
+    """تا وقتی جواب آماده نشده، بالای چت «در حال تایپ...» نشان می‌دهد."""
+    while not stop.is_set():
+        await tg("sendChatAction", chat_id=chat_id, action="typing")
+        try: await asyncio.wait_for(stop.wait(), timeout=4)
+        except asyncio.TimeoutError: pass
 
 async def delete_message(chat_id, message_id):
     try:
@@ -434,10 +469,24 @@ async def webhook(req: Request):
             await send_message(chat_id, await run(remember_info,"all","","list"))
             return {"ok":True}
         print("PATH: agent")
-        try: ans = await asyncio.wait_for(agent_brain(user_id, text), timeout=DEADLINE)
-        except asyncio.TimeoutError:
-            print("DEADLINE hit")
-            ans = "⏱ زمان پردازش تمام شد (سرویس مدل کند بود). یک بار دوباره بفرست یا سؤال را کوتاه‌تر کن."
+        first = "⏳ دریافت شد، در حال پردازش..."
+        st = await tg("sendMessage", chat_id=chat_id, text=first, disable_notification=True)
+        status_id = (st.get("result") or {}).get("message_id")
+        stop = asyncio.Event()
+        typing_task = asyncio.create_task(typing_loop(chat_id, stop))
+        last = {"t": first}
+        async def on_status(t):
+            if status_id and t != last["t"]:
+                last["t"] = t
+                await tg("editMessageText", chat_id=chat_id, message_id=status_id, text=t)
+        try:
+            try: ans = await asyncio.wait_for(agent_brain(user_id, text, on_status), timeout=DEADLINE)
+            except asyncio.TimeoutError:
+                print("DEADLINE hit")
+                ans = "⏱ زمان پردازش تمام شد (سرویس مدل کند بود). یک بار دوباره بفرست یا سؤال را کوتاه‌تر کن."
+        finally:
+            stop.set(); typing_task.cancel()
+            if status_id: await delete_message(chat_id, status_id)
         await send_message(chat_id, ans or "انجام شد ✅")
         return {"ok":True}
     except Exception as e:
