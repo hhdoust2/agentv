@@ -551,17 +551,25 @@ def _cells(line):
     if line.endswith("|"): line = line[:-1]
     return [c.strip() for c in line.split("|")]
 
-def _table_html(rows):
-    """جدول در تلگرام وجود ندارد: هر ردیف به یک آیتم خوانا (راست‌چین‌پذیر) تبدیل می‌شود."""
+def _iso(t, rtl):
+    """هر تکه را ایزوله می‌کند تا ترکیب فارسی/انگلیسی در یک خط جابه‌جا نشود."""
+    return f"\u2068{t}\u2069" if rtl else t
+
+def _table_html(rows, rtl=False):
+    """جدول در تلگرام وجود ندارد: هر ردیف یک آیتم می‌شود و ستون‌های بعدی هرکدام در یک خط جدا می‌آیند."""
     hdr, out = rows[0], []
     for r in rows[1:]:
         r = (r + [""] * len(hdr))[:max(len(hdr), len(r))]
         title = _inline(r[0], bold=False) or "—"
-        if len(hdr) == 2:
-            out.append(f"• <b>{title}</b> — {_inline(r[1])}")
+        pairs = [(_inline(hdr[i], bold=False) if i < len(hdr) else "", _inline(r[i])) for i in range(1, len(r)) if r[i].strip()]
+        if len(hdr) == 2 and pairs:
+            out.append(f"• <b>{title}</b> — {_iso(pairs[0][1], rtl)}")
+        elif not pairs:
+            out.append(f"• <b>{title}</b>")
+        elif len(pairs) <= 2 and sum(len(h) + len(v) for h, v in pairs) <= 50:
+            out.append(f"• <b>{title}</b>\n   " + " · ".join(f"{_iso(h, rtl)}: {_iso(v, rtl)}" for h, v in pairs))
         else:
-            det = " · ".join(f"{_inline(hdr[i], bold=False)}: {_inline(r[i])}" for i in range(1, len(r)) if r[i].strip())
-            out.append(f"• <b>{title}</b>" + (f"\n   {det}" if det else ""))
+            out.append(f"• <b>{title}</b>\n" + "\n".join(f"   ◦ {_iso(h, rtl)}: {_iso(v, rtl)}" if h else f"   ◦ {_iso(v, rtl)}" for h, v in pairs))
     return "\n".join(out)
 
 def md_to_tg_html(md):
@@ -585,7 +593,7 @@ def md_to_tg_html(md):
             rows, i = [_cells(line)], i + 2
             while i < len(lines) and "|" in lines[i] and lines[i].strip():
                 rows.append(_cells(lines[i])); i += 1
-            emit(_table_html(rows)); continue
+            emit(_table_html(rows, rtl)); continue
         if st.startswith(">"):                         # نقل‌قول
             q = []
             while i < len(lines) and lines[i].strip().startswith(">"):
