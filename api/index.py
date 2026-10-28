@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request, Response
 import os, time, json, httpx, traceback, asyncio, logging, ipaddress, socket, subprocess, sys
 from urllib.parse import urlparse, urljoin
+import inspect
+from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 from tavily import TavilyClient
 from bs4 import BeautifulSoup
@@ -229,6 +231,132 @@ SYSTEM_PROMPT = """
 - هرگز نگو نمی‌توانم، تلاش کن
 """
 
+# ---------- مهارت‌های کدی (ابزارهای واقعی) ----------
+# برای اضافه کردن یک ابزار جدید فقط یک تابع با دکوراتور @code_tool بنویس؛ بقیه‌ی کارها خودکار است.
+CODE_TOOLS = {}
+
+def code_tool(name, desc, props, required, label):
+    def deco(fn):
+        CODE_TOOLS[name] = {"fn": fn, "label": label, "desc": desc, "params": list(props.keys()),
+            "schema": {"type": "function", "function": {"name": name, "description": desc,
+                       "parameters": {"type": "object", "properties": props, "required": required}}}}
+        return fn
+    return deco
+
+def call_code_tool(name, args):
+    t = CODE_TOOLS[name]
+    ok = inspect.signature(t["fn"]).parameters
+    try: return str(t["fn"](**{k: v for k, v in (args or {}).items() if k in ok}))
+    except Exception as e:
+        print(f"CODE TOOL {name} err: {e}")
+        return f"خطا در ابزار {name}: {e}"
+
+def cli_tool(name, rest):
+    """برای تست مستقیم از چت: /tool نام آرگومان   یا   /tool نام {json}"""
+    t = CODE_TOOLS.get(name)
+    if not t: return "ابزاری با این نام نیست. لیست: /tools"
+    rest = (rest or "").strip()
+    try:
+        args = json.loads(rest) if rest.startswith("{") else ({t["params"][0]: rest} if rest and t["params"] else {})
+    except Exception as e: return f"JSON نامعتبر: {e}"
+    return call_code_tool(name, args)
+
+_UA = {"User-Agent": "Mozilla/5.0"}
+
+def _get(url, **params):
+    r = httpx.get(url, params=params or None, timeout=10, headers=_UA)
+    r.raise_for_status()
+    return r.json()
+
+def _g2j(gy, gm, gd):
+    gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 + gd + gdm[gm - 1]
+    jy = -1595 + 33 * (days // 12053); days %= 12053
+    jy += 4 * (days // 1461); days %= 1461
+    if days > 365: jy += (days - 1) // 365; days = (days - 1) % 365
+    if days < 186: jm = 1 + days // 31; jd = 1 + days % 31
+    else: jm = 7 + (days - 186) // 30; jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+_J_MONTHS = ["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"]
+_WEEKDAYS = ["دوشنبه","سه‌شنبه","چهارشنبه","پنجشنبه","جمعه","شنبه","یکشنبه"]
+
+@code_tool("current_datetime", "تاریخ و ساعت دقیق همین الان (میلادی و شمسی). برای هر سؤال درباره‌ی امروز/ساعت/تاریخ از این ابزار استفاده کن.",
+           {"timezone": {"type": "string", "description": "مثل Asia/Tehran (پیش‌فرض)"}}, [], "🕒 در حال گرفتن زمان...")
+def current_datetime(timezone: str = "Asia/Tehran"):
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(timezone))
+    except Exception:
+        now = datetime.now(__import__("datetime").timezone(timedelta(hours=3, minutes=30)))
+        timezone = "Asia/Tehran (UTC+3:30)"
+    jy, jm, jd = _g2j(now.year, now.month, now.day)
+    return (f"منطقه‌ی زمانی: {timezone}\n"
+            f"میلادی: {now.strftime('%Y-%m-%d')} ساعت {now.strftime('%H:%M')}\n"
+            f"شمسی: {_WEEKDAYS[now.weekday()]} {jd} {_J_MONTHS[jm-1]} {jy}")
+
+def _fmt(x):
+    x = float(x)
+    return f"{x:,.2f}" if x >= 1 else f"{x:.6f}".rstrip("0").rstrip(".")
+
+@code_tool("crypto_price", "قیمت لحظه‌ای و آمار ۲۴ ساعته‌ی یک ارز دیجیتال (دلار). برای هر سؤال قیمت کریپتو حتماً از این ابزار استفاده کن و از حافظه عدد نگو.",
+           {"symbol": {"type": "string", "description": "نماد مثل BTC یا ADA یا ETH"}}, ["symbol"], "💰 در حال گرفتن قیمت...")
+def crypto_price(symbol: str):
+    sym = symbol.upper().replace("/", "").replace("-", "").replace(" ", "")
+    pair = sym if sym.endswith(("USDT", "USDC")) else sym + "USDT"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        d = _get("https://api.mexc.com/api/v3/ticker/24hr", symbol=pair)
+        last, op = float(d["lastPrice"]), float(d["openPrice"])
+        ch = (last - op) / op * 100 if op else 0
+        return (f"{pair} (MEXC) — {now}\nقیمت: {_fmt(last)} دلار\nتغییر ۲۴ساعته: {ch:+.2f}%\n"
+                f"بالاترین ۲۴ساعت: {_fmt(d['highPrice'])}\nپایین‌ترین ۲۴ساعت: {_fmt(d['lowPrice'])}\n"
+                f"حجم ۲۴ساعت: {_fmt(d.get('quoteVolume', 0))} دلار")
+    except Exception as e:
+        print(f"MEXC err: {e}; trying CoinGecko")
+    base = pair[:-4]
+    res = _get("https://api.coingecko.com/api/v3/search", query=base)
+    coins = [c for c in res.get("coins", []) if c.get("symbol", "").upper() == base] or res.get("coins", [])
+    if not coins: return f"ارز {base} پیدا نشد."
+    m = _get("https://api.coingecko.com/api/v3/coins/markets", vs_currency="usd", ids=coins[0]["id"])[0]
+    return (f"{m['name']} ({m['symbol'].upper()}) (CoinGecko) — {now}\nقیمت: {_fmt(m['current_price'])} دلار\n"
+            f"تغییر ۲۴ساعته: {m.get('price_change_percentage_24h') or 0:+.2f}%\n"
+            f"بالاترین/پایین‌ترین ۲۴ساعت: {_fmt(m['high_24h'])} / {_fmt(m['low_24h'])}\n"
+            f"ارزش بازار: {_fmt(m['market_cap'])} دلار")
+
+_WCODE = {0: "آسمان صاف", 1: "تقریباً صاف", 2: "کمی ابری", 3: "ابری", 45: "مه", 48: "مه یخی",
+          51: "نمنم باران", 53: "نمنم باران", 55: "نمنم باران", 61: "باران ملایم", 63: "باران", 65: "باران شدید",
+          71: "برف ملایم", 73: "برف", 75: "برف شدید", 80: "رگبار", 81: "رگبار", 82: "رگبار شدید", 95: "رعد و برق", 96: "رعد و تگرگ", 99: "رعد و تگرگ"}
+
+@code_tool("weather", "وضعیت هوای فعلی و پیش‌بینی ۳ روز آینده‌ی یک شهر.",
+           {"city": {"type": "string", "description": "نام شهر؛ فارسی یا انگلیسی"}}, ["city"], "🌤 در حال گرفتن آب‌وهوا...")
+def weather(city: str):
+    g = _get("https://geocoding-api.open-meteo.com/v1/search", name=city, count=1, language="fa")
+    if not g.get("results"): return f"شهر «{city}» پیدا نشد."
+    c = g["results"][0]
+    w = _get("https://api.open-meteo.com/v1/forecast", latitude=c["latitude"], longitude=c["longitude"],
+             current="temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+             daily="temperature_2m_max,temperature_2m_min,precipitation_probability_max", timezone="auto", forecast_days=3)
+    cur, dl = w["current"], w["daily"]
+    out = (f"{c.get('name')}، {c.get('country','')}\nالان: {cur['temperature_2m']}°C، {_WCODE.get(cur['weather_code'], 'نامشخص')}، "
+           f"رطوبت {cur['relative_humidity_2m']}٪، باد {cur['wind_speed_10m']} km/h\nپیش‌بینی:")
+    for i, day in enumerate(dl["time"]):
+        out += f"\n• {day}: {dl['temperature_2m_min'][i]} تا {dl['temperature_2m_max'][i]}°C، احتمال بارش {dl['precipitation_probability_max'][i]}٪"
+    return out
+
+@code_tool("usdt_toman", "قیمت لحظه‌ای تتر (USDT) به تومان از بازار ایران (نوبیتکس).", {}, [], "💵 در حال گرفتن قیمت تتر...")
+def usdt_toman():
+    d = _get("https://api.nobitex.ir/market/stats", srcCurrency="usdt", dstCurrency="rls")
+    st = (d.get("stats") or {}).get("usdt-rls") or {}
+    if not st.get("latest"): return "قیمت تتر از نوبیتکس دریافت نشد."
+    t = lambda k: f"{int(float(st[k]) / 10):,}" if st.get(k) else "—"
+    return (f"تتر/تومان (Nobitex) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"آخرین قیمت: {t('latest')} تومان\nبهترین خرید: {t('bestBuy')} | بهترین فروش: {t('bestSell')}\n"
+            f"بالاترین/پایین‌ترین امروز: {t('dayHigh')} / {t('dayLow')}")
+
+tools.extend(t["schema"] for t in CODE_TOOLS.values())
+
 # ---------- مهارت‌ها (دستورالعمل‌هایی که خودت می‌نویسی) ----------
 MAX_SKILLS = 30
 
@@ -282,6 +410,7 @@ SKILL_TOOL = {"type":"function","function":{"name":"use_skill","description":"ب
 
 def run_tool(name, args):
     if name == "use_skill": return use_skill(args["name"])
+    if name in CODE_TOOLS: return call_code_tool(name, args)
     if name == "search_web": return search_web(args["query"])
     if name == "browse_url": return browse_url(args["url"])
     if name == "execute_python": return execute_python(args["code"])
@@ -361,7 +490,8 @@ async def agent_brain(user_id, user_text: str, on_status=None):
             messages.append(msg)
             labels = []
             for tc in msg.tool_calls:
-                l = TOOL_LABELS.get(tc.function.name, "⚙️ در حال اجرای ابزار...")
+                n_ = tc.function.name
+                l = TOOL_LABELS.get(n_) or (CODE_TOOLS.get(n_) or {}).get("label") or "⚙️ در حال اجرای ابزار..."
                 if l not in labels: labels.append(l)
             await status("\n".join(labels))
             results = await asyncio.gather(*[call_tool(tc, step) for tc in msg.tool_calls])  # موازی
@@ -453,7 +583,7 @@ async def webhook(req: Request):
             await send_message(chat_id,"فعلاً فقط پیام متنی را می‌فهمم 🙂")
             return {"ok":True}
         if text.startswith("/start"):
-            await send_message(chat_id,"سلام! من ایجنت هوشمند تو هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد بنویس و اجرا کن\n• لینک بفرست تا خلاصه کنم\n• حافظه دائمی + تسک + فایل\n• تنظیمات مدل: /settings ، /provider ، /model ، /key ، /test\n• مهارت‌ها: /skills ، /addskill ، /viewskill ، /delskill")
+            await send_message(chat_id,"سلام! من ایجنت هوشمند تو هستم 🤖\n• تحقیق عمیق: بگو تحقیق کن ...\n• اجرای کد: بگو کد بنویس و اجرا کن\n• لینک بفرست تا خلاصه کنم\n• حافظه دائمی + تسک + فایل\n• تنظیمات مدل: /settings ، /provider ، /model ، /key ، /test\n• مهارت‌ها: /skills ، /addskill ، /viewskill ، /delskill\n• ابزارها: /tools ، /tool")
             return {"ok":True}
         if text.startswith("/settings"):
             cfg = await run(get_cfg)
@@ -512,6 +642,14 @@ async def webhook(req: Request):
                 else:
                     sk = await run(get_skills)
                     await send_message(chat_id, f"📚 {arg}\n{sk[arg]['desc']}\n\n{sk[arg]['body']}" if arg in sk else "چنین مهارتی نیست. /skills")
+            return {"ok":True}
+        if cmd0 in ("/tools", "/tool"):
+            if cmd0 == "/tools":
+                await send_message(chat_id, "🧰 ابزارهای کدی:\n" + "\n".join(f"• {n} — {t['desc'][:70]}" for n, t in CODE_TOOLS.items()) + "\n\nتست مستقیم: /tool نام آرگومان\nمثال: /tool crypto_price ADA")
+            else:
+                parts = text.split(None, 2)
+                if len(parts) < 2: await send_message(chat_id, "مثال: /tool crypto_price ADA")
+                else: await send_message(chat_id, await run(cli_tool, parts[1], parts[2] if len(parts) > 2 else ""))
             return {"ok":True}
         if text.startswith("یاد بگیر") or text.startswith("ذخیره کن"):
             content=text.replace("یاد بگیر","").replace("ذخیره کن","").strip()
