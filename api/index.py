@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, Response
 import os, time, json, httpx, traceback, asyncio, logging, ipaddress, socket, subprocess, sys
+import re, html
 from urllib.parse import urlparse, urljoin
 import inspect
 from datetime import datetime, timezone, timedelta
@@ -146,15 +147,6 @@ def browse_url(url: str):
         return "\n".join(lines)[:6000]
     except Exception as e: return f"خطا در باز کردن URL: {e}"
 
-def _exec_inprocess(code):
-    import io, contextlib
-    out = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(out): exec(code, {})
-        return out.getvalue()
-    except Exception:
-        return f"خطا در اجرا:\n{traceback.format_exc()[:3000]}"
-
 def execute_python(code: str):
     if not ENABLE_PYTHON: return "اجرای کد غیرفعال است"
     try:
@@ -162,9 +154,10 @@ def execute_python(code: str):
                            timeout=20, env={"PATH": "/usr/local/bin:/usr/bin:/bin"})
         val = (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired: return "خطا: اجرای کد بیش از ۲۰ ثانیه طول کشید"
-    except OSError as e:  # پایتون جدا در دسترس نبود؛ مثل نسخه‌ی اولیه داخل خود برنامه اجرا می‌کنیم
-        print(f"subprocess unavailable ({e}); in-process exec")
-        val = _exec_inprocess(code)
+    except OSError as e:
+        # دیگر fallback به exec داخل خود پروسس نیست: آن مسیر ایزولاسیون subprocess
+        # را دور می‌زد و کد مدل را با دسترسی کامل سرور اجرا می‌کرد.
+        return f"خطا: اجرای جداگانه‌ی کد در دسترس نیست ({e})؛ کد اجرا نشد."
     return val[:4000] if val else "کد بدون خروجی اجرا شد ✅"
 
 def manage_task(action: str, task: str = "", task_id: int = 0):
@@ -229,6 +222,12 @@ SYSTEM_PROMPT = """
 - حافظه را با remember_info مدیریت کن
 - همیشه فارسی، دقیق و کاربردی جواب بده
 - هرگز نگو نمی‌توانم، تلاش کن
+- فرمت جواب برای تلگرام (مهم — خروجی خام در تلگرام به‌هم می‌ریزد):
+  • فارسی، کوتاه و بخش‌بندی‌شده؛ تیتر را فقط با **متن** بنویس، هرگز با # یا ##
+  • جدول Markdown ننویس (در تلگرام جدول رندر نمی‌شود)؛ به‌جای هر ردیف جدول یک بولت بنویس: • نام: مقدار
+  • کد را فقط داخل بلاک ```زبان ... ``` کامل و قابل‌اجرا بنویس؛ وسط کد «...» یا خلاصه نگذار
+  • اول خلاصه/نتیجه، بعد جزئیات؛ اگر جواب خیلی طولانی شد مهم‌ترین‌ها اول باشند
+  • لینک را به‌صورت [متن](https://...) بنویس، نه URL لخت وسط جمله
 """
 
 # ---------- مهارت‌های کدی (ابزارهای واقعی) ----------
@@ -298,7 +297,10 @@ def current_datetime(timezone: str = "Asia/Tehran"):
 
 def _fmt(x):
     x = float(x)
-    return f"{x:,.2f}" if x >= 1 else f"{x:.6f}".rstrip("0").rstrip(".")
+    if x >= 1: return f"{x:,.2f}"
+    if x == 0: return "0"
+    # ۸ رقم اعشار تا قیمت‌های خیلی ریز (مثلاً 0.00000012) به "0" تبدیل نشوند
+    return f"{x:.8f}".rstrip("0").rstrip(".")
 
 @code_tool("crypto_price", "قیمت لحظه‌ای و آمار ۲۴ ساعته‌ی یک ارز دیجیتال (دلار). برای هر سؤال قیمت کریپتو حتماً از این ابزار استفاده کن و از حافظه عدد نگو.",
            {"symbol": {"type": "string", "description": "نماد مثل BTC یا ADA یا ETH"}}, ["symbol"], "💰 در حال گرفتن قیمت...")
@@ -319,7 +321,9 @@ def crypto_price(symbol: str):
     res = _get("https://api.coingecko.com/api/v3/search", query=base)
     coins = [c for c in res.get("coins", []) if c.get("symbol", "").upper() == base] or res.get("coins", [])
     if not coins: return f"ارز {base} پیدا نشد."
-    m = _get("https://api.coingecko.com/api/v3/coins/markets", vs_currency="usd", ids=coins[0]["id"])[0]
+    markets = _get("https://api.coingecko.com/api/v3/coins/markets", vs_currency="usd", ids=coins[0]["id"])
+    if not markets: return f"قیمت {base} از CoinGecko دریافت نشد."
+    m = markets[0]
     return (f"{m['name']} ({m['symbol'].upper()}) (CoinGecko) — {now}\nقیمت: {_fmt(m['current_price'])} دلار\n"
             f"تغییر ۲۴ساعته: {m.get('price_change_percentage_24h') or 0:+.2f}%\n"
             f"بالاترین/پایین‌ترین ۲۴ساعت: {_fmt(m['high_24h'])} / {_fmt(m['low_24h'])}\n"
@@ -423,6 +427,70 @@ DEADLINE = 50          # کل زمان مجاز برای یک درخواست (ث
 MAX_STEPS = 6          # حداکثر مرحله‌ی ابزار
 TIME_BUDGET = 28       # بعد از این ثانیه مرحله‌ی جدید شروع نمی‌شود (محدودیت Vercel ۶۰ ثانیه است)
 
+# --- مدیریت سرریز کانتکست (جایگزین خلاصه‌سازی که در index.py نبود) ---
+# بدون این بخش، تاریخچه‌ی طولانی فقط با خطا برمی‌گشت و تا /reset درست نمی‌شد.
+_OVERFLOW_MARKERS = ("context_length_exceeded", "context length", "maximum context",
+                     "too long", "token limit", "exceeds the context", "input too long")
+
+def _is_context_overflow(err) -> bool:
+    s = str(err).lower()
+    return any(m in s for m in _OVERFLOW_MARKERS) or ("400" in s and "context" in s)
+
+def _shrink_messages(messages):
+    """قدیمی‌ترین تبادل تاریخچه را حذف می‌کند (سیستم و آخرین سؤال کاربر می‌مانند)؛
+    اگر تبادلی برای حذف نبود، طولانی‌ترین خروجی ابزار را کوتاه می‌کند.
+    اگر چیزی برای کوتاه کردن نبود، همان لیست برمی‌گردد."""
+    msgs = list(messages)
+    for i in range(1, len(msgs) - 1):
+        m = msgs[i]
+        if isinstance(m, dict) and m.get("role") == "user":
+            for j in range(i + 1, len(msgs)):
+                if isinstance(msgs[j], dict) and msgs[j].get("role") == "assistant":
+                    return msgs[:i] + msgs[j + 1:]
+            return msgs[:i] + msgs[i + 1:]
+    longest, longest_len = -1, 1000
+    for i, m in enumerate(msgs):
+        if isinstance(m, dict) and m.get("role") == "tool":
+            c = str(m.get("content") or "")
+            if len(c) > longest_len:
+                longest, longest_len = i, len(c)
+    if longest >= 0:
+        out = list(msgs)
+        out[longest] = {**out[longest], "content": str(out[longest].get("content"))[:500] + "\n… (کوتاه شد)"}
+        return out
+    return msgs
+
+def _trim_to_budget(messages, limit=30000):
+    """پیش از فراخوانی مدل، پیام‌ها را تا سقف کاراکتر کوتاه می‌کند."""
+    msgs = list(messages)
+    def _chars(ms):
+        total = 0
+        for m in ms:
+            if isinstance(m, dict): total += len(str(m.get("content") or ""))
+            else: total += len(str(getattr(m, "content", "") or ""))
+        return total
+    while _chars(msgs) > limit:
+        shrunk = _shrink_messages(msgs)
+        if shrunk == msgs: break
+        msgs = shrunk
+    return msgs
+
+def _chat_create(cli, cfg, messages, **kwargs):
+    """فراخوانی مدل با retry در سرریز کانتکست: هر بار قدیمی‌ترین تبادل حذف می‌شود."""
+    msgs = _trim_to_budget(messages)
+    for attempt in range(4):
+        try:
+            return cli.chat.completions.create(model=cfg["model"], messages=msgs, **kwargs)
+        except Exception as e:
+            if not _is_context_overflow(e) or attempt == 3:
+                raise
+            shrunk = _shrink_messages(msgs)
+            if shrunk == msgs:
+                raise
+            print(f"Context overflow, shrinking history (attempt {attempt + 1}); messages {len(msgs)} -> {len(shrunk)}")
+            msgs = shrunk
+    raise RuntimeError("unreachable")
+
 def _load_history(user_id):
     """آخرین HISTORY_LEN تبادل (هر تبادل = یک سؤال + یک جواب) از دیتابیس."""
     if HISTORY_LEN <= 0:
@@ -481,8 +549,7 @@ async def agent_brain(user_id, user_text: str, on_status=None):
     step = 0
     while step < MAX_STEPS and time.monotonic() - t0 < TIME_BUDGET:
         try:
-            r = await asyncio.to_thread(lambda: cli.chat.completions.create(
-                model=cfg["model"], messages=messages, tools=tl, tool_choice="auto", timeout=to()))
+            r = await asyncio.to_thread(lambda: _chat_create(cli, cfg, messages, tools=tl, tool_choice="auto", timeout=to()))
             msg = r.choices[0].message
             if not msg.tool_calls:
                 await asyncio.to_thread(_save_history, user_id, user_text, msg.content)
@@ -500,6 +567,9 @@ async def agent_brain(user_id, user_text: str, on_status=None):
             step += 1
             await status("🤔 در حال بررسی نتایج...")
         except Exception as e:
+            if _is_context_overflow(e):
+                print(f"AGENT context overflow, could not shrink further: {e}")
+                return "خطا: گفتگو خیلی طولانی شد و مدل آن را قبول نکرد. با /reset حافظه را پاک کن و دوباره بفرست."
             if "429" in str(e):
                 print("429 hit, waiting 5s...")
                 await asyncio.sleep(5)
@@ -512,20 +582,287 @@ async def agent_brain(user_id, user_text: str, on_status=None):
     messages.append({"role":"user","content":"زمان یا مراحل ابزار تمام شد. دیگر ابزار نخواه و ننویس «بررسی می‌کنم». همین الان با اطلاعاتی که تا اینجا جمع کردی جواب نهایی کامل و مرتب بده؛ اگر چیزی را پیدا نکردی صادقانه بگو."})
     await status("✍️ در حال نوشتن جواب نهایی...")
     try:
-        final = await asyncio.to_thread(lambda: cli.chat.completions.create(model=cfg["model"], messages=messages, timeout=to()))
+        final = await asyncio.to_thread(lambda: _chat_create(cli, cfg, messages, timeout=to()))
         await asyncio.to_thread(_save_history, user_id, user_text, final.choices[0].message.content)
         return final.choices[0].message.content or "تحقیق کامل شد ✅"
     except Exception as e: return f"خطا در جمع بندی: {e}"
 
-async def send_message(chat_id, text):
-    text = text or "انجام شد ✅"
+# ---------- فرمت خروجی تلگرام ----------
+# علت به‌هم‌ریختگی (اسکرین‌شات ۱۹ نوامبر): خروجی مدل Markdown است، ولی
+# send_message قبلی نه parse_mode داشت و نه متن را درست می‌شکست؛ پس
+# `##` و `**` و جدول `|...|` همان‌طور خام دیده می‌شد، کد بدون <pre>
+# با متن فارسی قاطی می‌شد (RTL: پرانتز و رشته‌های فارسی داخل کد جابه‌جا
+# می‌شد) و پیام‌های ۴۰۰۰ کاراکتری وسط خط و وسط بلاک کد نصف می‌شدند.
+# راه‌حل این لایه:
+#   ۱) Markdown -> HTML تلگرام (نه MarkdownV2 که با `_` و `*` و `__name__`
+#      در کد فارسی/پایتون مدام خطا می‌دهد)؛ جدول به لیست بولت تبدیل می‌شود.
+#   ۲) تقسیم هوشمند در مرز پاراگراف/بلاک، هرگز وسط <pre> و هرگز وسط کلمه
+#      اگر ممکن باشد؛ هر پیام زیر ۴۰۹۶ کاراکتر تلگرام می‌ماند.
+#   ۳) کد طولانی -> فایل (sendDocument) به‌جای سیل پیام؛ توضیح فارسی و
+#      کد در پیام‌های جدا می‌مانند تا RTL متن، کد LTR را خراب نکند.
+TG_LIMIT = 4096
+TG_SAFE = 3800  # حاشیه برای تگ‌های HTML
+CODE_FILE_MIN_CHARS = 1200
+CODE_FILE_MIN_LINES = 30
+
+_LANG_EXT = {"python": "py", "py": "py", "javascript": "js", "js": "js",
+             "typescript": "ts", "ts": "ts", "bash": "sh", "sh": "sh",
+             "shell": "sh", "json": "json", "html": "html", "css": "css",
+             "sql": "sql", "go": "go", "rust": "rs", "java": "java",
+             "c": "c", "cpp": "cpp", "yaml": "yaml", "yml": "yaml",
+             "markdown": "md", "md": "md", "text": "txt", "txt": "txt", "": "txt"}
+
+def _tg_escape(s):
+    return html.escape(s, quote=False)
+
+def _md_inline_to_html(s):
+    # s از قبل escape شده است؛ < و > و & در آن به‌صورت &lt; و ... هستند.
+    # ۱) لینک [متن](url) — قبل از URL لخت، تا دوبار تگ نخورد.
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+    # ۲) کد درون‌خطی `x`
+    s = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", s)
+    # ۳) بولد **x** — عمداً __x__ تبدیل نمی‌شود: __name__ در پایتون خراب می‌شد.
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+    # ۴) خط‌خورده
+    s = re.sub(r"~~(.+?)~~", r"<s>\1</s>", s)
+    # ۵) ایتالیک *x* — عمداً _x_ تبدیل نمی‌شود: snake_case خراب می‌شد.
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", s)
+    # ۶) URL لخت (نه داخل href و نه متن لینک)
+    s = re.sub(r"(?<![\"'>=])(https?://[^\s<]+)", r'<a href="\1">\1</a>', s)
+    return s
+
+def _md_to_tg_html(text):
+    """Markdown مدل را به HTML امن تلگرام تبدیل می‌کند."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # ۱) بلاک‌های کد ``` را جدا کن تا escape و فرمت روی آن‌ها اثر نکند.
+    code_blocks = []
+    def _code_repl(m):
+        lang = (m.group(1) or "").strip().lower()
+        code = (m.group(2) or "").rstrip("\n")
+        idx = len(code_blocks)
+        code_blocks.append((lang, code))
+        return f"\x00CODE{idx}\x00"
+    # ``` ناتمام هم تا آخر متن کد حساب می‌شود (مدل گاهی بستن را جا می‌اندازد).
+    text = re.sub(r"```([A-Za-z0-9_+-]*)[ \t]*\n?(.*?)(?:```|$)", _code_repl, text, flags=re.S)
+    # ۲) بقیه را escape کن (تزریق <script> و <b> از سمت مدل خنثی می‌شود).
+    text = html.escape(text, quote=False)
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "\x00CODE" in line:
+            out.append(line)
+            i += 1
+            continue
+        # جدول Markdown -> لیست بولت (تلگرام جدول ندارد)
+        # _strip_b: سلول‌ها ممکن است خودشان **بولد** باشند؛ بولد تودرتو
+        # (<b><b>...</b></b>) را تلگرام رد می‌کند، پس قبل از پیچیدن دوباره، تگ b را برمی‌داریم.
+        if line.strip().startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|[\s:|\-]+\|\s*$", lines[i + 1]):
+            header = [c.strip() for c in line.strip().strip("|").split("|")]
+            i += 2
+            out.append(f"<b>{' — '.join(re.sub(r'</?b>', '', _md_inline_to_html(c)) for c in header)}</b>")
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [_md_inline_to_html(c.strip()) for c in lines[i].strip().strip("|").split("|")]
+                if len(cells) >= 2:
+                    out.append(f"• <b>{re.sub(r'</?b>', '', cells[0])}</b>: {' — '.join(cells[1:])}")
+                elif cells:
+                    out.append(f"• {cells[0]}")
+                i += 1
+            continue
+        if re.match(r"^\s*(-{3,}|_{3,}|\*{3,})\s*$", line):
+            out.append("")
+            i += 1
+            continue
+        m = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if m:
+            out.append(f"<b>{re.sub(r'</?b>', '', _md_inline_to_html(m.group(2)))}</b>")
+            i += 1
+            continue
+        m = re.match(r"^&gt;\s?(.*)$", line)
+        if m:
+            out.append(f"<blockquote>{_md_inline_to_html(m.group(1))}</blockquote>")
+            i += 1
+            continue
+        m = re.match(r"^\s*[-*]\s+(.+)$", line)
+        if m:
+            out.append(f"• {_md_inline_to_html(m.group(1))}")
+            i += 1
+            continue
+        out.append(_md_inline_to_html(line))
+        i += 1
+    html_text = "\n".join(out)
+    for idx, (lang, code) in enumerate(code_blocks):
+        esc = html.escape(code, quote=False)
+        if lang and re.match(r"^[A-Za-z0-9_+-]+$", lang):
+            pre = f'<pre language="{lang}">{esc}</pre>'
+        else:
+            pre = f"<pre>{esc}</pre>"
+        html_text = html_text.replace(f"\x00CODE{idx}\x00", pre)
+    return html_text
+
+def _split_pre_block(block):
+    m = re.match(r'<pre(?: language="([^"]+)")?>(.*?)</pre>$', block, flags=re.S)
+    if not m:
+        return [block]
+    lang, inner = m.group(1), m.group(2)
+    open_tag = f'<pre language="{lang}">' if lang else "<pre>"
+    chunks, cur = [], ""
+    for ln in inner.split("\n"):
+        add = ln + "\n"
+        if cur and len(open_tag) + len(cur) + len(add) + len("</pre>") > TG_SAFE:
+            chunks.append(open_tag + cur.rstrip("\n") + "</pre>")
+            cur = add
+        else:
+            cur += add
+    if cur:
+        chunks.append(open_tag + cur.rstrip("\n") + "</pre>")
+    return chunks or [block]
+
+def _split_text_block(block):
+    """متن بدون <pre> را در مرز پاراگراف/خط/کلمه می‌شکند."""
+    if len(block) <= TG_SAFE:
+        return [block]
+    chunks, cur = [], ""
+    for para in block.split("\n\n"):
+        if cur and len(cur) + len(para) + 2 <= TG_SAFE:
+            cur += "\n\n" + para
+            continue
+        if cur:
+            chunks.append(cur)
+            cur = ""
+        if len(para) <= TG_SAFE:
+            cur = para
+            continue
+        for line in para.split("\n"):
+            if cur and len(cur) + len(line) + 1 <= TG_SAFE:
+                cur += "\n" + line
+                continue
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            if len(line) <= TG_SAFE:
+                cur = line
+                continue
+            for word in line.split(" "):
+                if cur and len(cur) + len(word) + 1 <= TG_SAFE:
+                    cur += " " + word
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    cur = word
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c]
+
+def _split_tg_html(html_text):
+    """HTML تلگرام را به پیام‌های زیر سقف می‌شکند؛ <pre> هرگز نصف نمی‌شود."""
+    parts = re.split(r"(<pre(?:\s+language=\"[A-Za-z0-9_+-]+\")?>.*?</pre>)", html_text, flags=re.S)
+    chunks, cur = [], ""
+    def flush():
+        nonlocal cur
+        if cur:
+            chunks.append(cur)
+            cur = ""
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<pre"):
+            if len(part) > TG_SAFE:
+                flush()
+                chunks.extend(_split_pre_block(part))
+            elif cur and len(cur) + len(part) + 1 > TG_SAFE:
+                flush()
+                cur = part
+            else:
+                cur = (cur + "\n" + part) if cur else part
+        else:
+            for piece in _split_text_block(part):
+                if cur and len(cur) + len(piece) + 1 <= TG_SAFE:
+                    cur += "\n" + piece
+                elif cur:
+                    flush()
+                    cur = piece
+                else:
+                    cur = piece
+    flush()
+    return [c for c in chunks if c.strip()]
+
+def _extract_long_code(markdown_text):
+    """بلاک‌های کد طولانی را از متن جدا می‌کند تا به‌صورت فایل فرستاده شوند.
+    برمی‌گرداند: (متن بدون آن بلاک‌ها، [(filename, code, lang), ...])"""
+    found = list(re.finditer(r"```([A-Za-z0-9_+-]*)[ \t]*\n?(.*?)(?:```|$)", markdown_text or "", flags=re.S))
+    keep, files = markdown_text or "", []
+    for m in reversed(found):
+        lang = (m.group(1) or "").strip().lower()
+        code = (m.group(2) or "").rstrip("\n")
+        nlines = code.count("\n") + 1 if code else 0
+        if len(code) >= CODE_FILE_MIN_CHARS or nlines >= CODE_FILE_MIN_LINES:
+            ext = _LANG_EXT.get(lang, "txt")
+            n = len(files) + 1
+            fname = f"script.{ext}" if n == 1 else f"script-{n}.{ext}"
+            files.append((fname, code, lang))
+            keep = keep[:m.start()] + f"📎 کد کامل در فایل پیوست است ({fname}، {nlines} خط)" + keep[m.end():]
+    files.reverse()
+    return keep, files
+
+async def _post_tg_html(chat_id, chunk):
+    """یک پیام HTML می‌فرستد؛ اگر تلگرام parse را رد کرد، به متن ساده برمی‌گردد."""
     async with httpx.AsyncClient() as c:
-        for i in range(0, len(text), 4000):
-            chunk = text[i:i+4000]
-            try:
-                await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":chat_id,"text":chunk}, timeout=15)
+        try:
+            r = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                             json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML",
+                                   "disable_web_page_preview": True}, timeout=15)
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code == 200 and body.get("ok") is not False:
                 print(f"Sent to {chat_id}")
-            except Exception as e: print(f"Send err: {e}")
+                return True
+            desc = str(body.get("description", ""))
+            print(f"Send err: HTTP {r.status_code} {desc[:200]}")
+            if "parse" in desc.lower() or "entities" in desc.lower():
+                plain = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+                r2 = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                  json={"chat_id": chat_id, "text": plain[:TG_LIMIT]}, timeout=15)
+                print(f"Send plain fallback: HTTP {r2.status_code}")
+                return r2.status_code == 200
+            return False
+        except Exception as e:
+            print(f"Send err: {e}")
+            return False
+
+async def send_document(chat_id, filename, content, caption=None):
+    try:
+        async with httpx.AsyncClient() as c:
+            data = {"chat_id": str(chat_id)}
+            if caption:
+                data["caption"] = _md_to_tg_html(caption)[:1024]
+                data["parse_mode"] = "HTML"
+            files = {"document": (filename, content.encode("utf-8"), "text/plain; charset=utf-8")}
+            r = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                             data=data, files=files, timeout=30)
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            if r.status_code != 200 or body.get("ok") is False:
+                print(f"SendDocument err: HTTP {r.status_code} {str(body.get('description', ''))[:200]}")
+                await send_message(chat_id, f"📎 {filename}\n```\n{content[:3500]}\n```", allow_file=False)
+            else:
+                print(f"Sent document {filename} to {chat_id}")
+    except Exception as e:
+        print(f"SendDocument err: {e}")
+
+async def send_message(chat_id, text, allow_file=True):
+    """نقطه‌ی اصلی خروجی: Markdown -> HTML تلگرام، تقسیم هوشمند، کد طولانی -> فایل.
+    امضایش با قبل سازگار است؛ همه‌ی فراخوانی‌های قدیمی بدون تغییر کار می‌کنند."""
+    text = text or "انجام شد ✅"
+    files = []
+    body = text
+    if allow_file:
+        body, files = _extract_long_code(text)
+    chunks = _split_tg_html(_md_to_tg_html(body)) or [_tg_escape(text)]
+    for chunk in chunks:
+        await _post_tg_html(chat_id, chunk)
+        await asyncio.sleep(0.15)
+    for fname, code, lang in files:
+        await send_document(chat_id, fname, code, caption=f"📎 {fname}")
 
 async def tg(method, **payload):
     try:
@@ -575,7 +912,11 @@ async def webhook(req: Request):
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
         text = norm(msg.get("text") or msg.get("caption") or "")
-        print(f"From {user_id}: {text[:300]}")
+        # مقدار /key هرگز در لاگ چاپ نمی‌شود (قبلاً متن کامل پیام، شامل کلید، لاگ می‌شد)
+        if text.startswith("/key"):
+            print(f"From {user_id}: /key *** (مقدار در لاگ ثبت نشد)")
+        else:
+            print(f"From {user_id}: {text[:300]}")
         if user_id != ALLOWED_USER_ID:
             await send_message(chat_id,"⛔ شما دسترسی ندارید")
             return {"ok":True}
@@ -670,7 +1011,7 @@ async def webhook(req: Request):
             res=await run(remember_info,"اسم","","get")
             await send_message(chat_id,f"اسم شما {res} هست 😊" if res!="یافت نشد" else "هنوز اسمت رو نمیدونم")
             return {"ok":True}
-        if text.startswith("/reset"):
+        if text.startswith("/reset") or text.startswith("/clear"):
             await run(db_set, f"hist:{user_id}", [])
             await send_message(chat_id, "✅ حافظه مکالمه پاک شد")
             return {"ok":True}
